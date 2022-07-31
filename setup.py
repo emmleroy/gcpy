@@ -12,7 +12,7 @@ LONG_DESCRIPTION = """\
 Python toolkit for working with GEOS-Chem output.
 """
 
-DISTNAME = "geoschem-gcpy"
+DISTNAME = "gcpy"
 AUTHOR = "GEOS-Chem Support Team"
 AUTHOR_EMAIL = "geos-chem-support@g.harvard.edu"
 URL = "https://github.com/geoschem/gcpy"
