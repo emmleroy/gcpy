@@ -1,4 +1,4 @@
----
+&---
 # =====================================================================
 # Benchmark configuration file (**EDIT AS NEEDED**)
 # customize in the following manner:
@@ -10,44 +10,72 @@
 # to gcc_dev (not gcc_ref!). This ensures consistency in version names
 # when doing GCHP vs GCC diff-of-diffs (mps, 6/27/19)
 # =====================================================================
-# configuration for 1 year fullchem benchmark
+#
+# Configuration for 1yr FullChemBenchmark
+#
+# paths:
+#   main_dir:    High-level directory containing ref & dev rundirs
+#   results_dir: Directory where plots/tables will be created
+#   weights_dir: Path to regridding weights
+#   spcdb_dir:   Folder in which the species_database.yml file is
+#                located.  If set to "default", then will look for
+#                species_database.yml in one of the Dev rundirs.
+#
 paths:
   main_dir: /n/holyscratch01/external_repos/GEOS-CHEM/gcgrid/geos-chem/validation/gcpy_test_data/1yr_fullchem
-  results_dir: BenchmarkResults
-  weights_dir: /n/holylfs/EXTERNAL_REPOS/GEOS-CHEM/gcgrid/gcdata/ExtData/GCHP/RegriddingWeights
+  results_dir: /path/to/BenchmarkResults
+  weights_dir: /n/holyscratch01/external_repos/GEOS-CHEM/gcgrid/data/ExtData/GCHP/RegriddingWeights
+  spcdb_dir: default
+#
+# data: Contains configurations for ref and dev runs
+#   version:         Version string (must not contain spaces)
+#   dir:             Path to run directory
+#   outputs_subdir:  Subdirectory w/ GEOS-Chem diagnostic files
+#   restarts_subdir: Subdirectory w/ GEOS-Chem restarts
+#   bmk_start:       Simulation start date (YYYY-MM-DDThh:mm:ss)
+#   bmk_end:         Simulation end date (YYYY-MM-DDThh:mm:ss)
+#   resolution:      GCHP resolution string
+#
 data:
-  # timestamp format YYYY-MM-DDThh:mm:ss
   ref:
     gcc:
       version: GCC_ref
       dir: GCC_ref
-      subdir: OutputDir
+      outputs_subdir: OutputDir
+      restarts_subdir: restarts
       bmk_start: "2019-01-01T00:00:00"
       bmk_end: "2020-01-01T00:00:00"
     gchp:
       version: GCHP_ref
       dir: GCHP_ref
-      subdir: OutputDir
+      outputs_subdir: OutputDir
+      restarts_subdir: Restarts
       bmk_start: "2019-01-01T00:00:00"
       bmk_end: "2020-01-01T00:00:00"
-      is_legacy: True
-      resolution: c48 # GCHP initial restart resolution (for mass tables)
+      is_pre_13.1: False               # for gcpy_test_data, edit if needed
+      is_pre_14.0: True                # for gcpy_test_data, edit if needed
+      resolution: c48                  # for gcpy_test_data, edit if needed
   dev:
     gcc:
       version: GCC_dev 
       dir: GCC_dev
-      subdir: OutputDir
+      outputs_subdir: OutputDir
+      restarts_subdir: restarts
       bmk_start: "2019-01-01T00:00:00"
       bmk_end: "2020-01-01T00:00:00"
     gchp:
       version: GCHP_dev
       dir: GCHP_dev
-      subdir: OutputDir
+      outputs_subdir: OutputDir
+      restarts_subdir: Restarts
       bmk_start: "2019-01-01T00:00:00"
       bmk_end: "2020-01-01T00:00:00"
-      is_legacy: False
-      resolution: c48
-
+      is_pre_13.1: False              # for gcpy_test_data, edit if needed
+      is_pre_14.0: False              # for gcpy_test_data, edit if needed
+      resolution: c24                 # for gcpy_test_data, edit if needed   
+#
+# options: Specify the types of comparisons to perform
+# 
 options:
   bmk_type: FullChemBenchmark
   gcpy_test: True # Specify if this is a gcpy test validation run
@@ -64,9 +92,13 @@ options:
       run: True
       dir: GCHP_version_comparison
       tables_subdir: Tables
-    # GCHP vs GCC diff of diffs not included in 1-yr full chemistry benchmark
-
-  outputs: # Output to generate (plots/tables will be created in this order):
+    gchp_vs_gcc_diff_of_diffs:
+      run: True
+      dir: GCHP_GCC_diff_of_diffs
+#
+# outputs: Types of output to generate (plots/tables)
+#
+  outputs:
     plot_conc: True
     plot_emis: True
     emis_table: True
@@ -77,7 +109,7 @@ options:
     aer_budget_table: True
     Ox_budget_table: True
     ste_table: True # GCC only
-    OH_metrics: True # GCC only
+    OH_metrics: True
     plot_options:
       by_spc_cat: True
       by_hco_cat: True

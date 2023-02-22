@@ -10,14 +10,17 @@ import yaml
 import numpy as np
 import pandas as pd
 import xarray as xr
+import sparselt.esmf
+import sparselt.xr
 from joblib import Parallel, delayed
 from tabulate import tabulate
-import gcpy.util as util
+from gcpy import util
 from gcpy.plot import compare_single_level, compare_zonal_mean
 from gcpy.regrid import create_regridders
 from gcpy.grid import get_troposphere_mask
 from gcpy.units import convert_units
 import gcpy.constants as gcon
+import gc
 
 # Save warnings format to undo overwriting built into PyPDF2
 warning_format = warnings.showwarning
@@ -276,7 +279,7 @@ def create_total_emissions_table(
                 )
 
                 # Set Dev to NaN (missing values) everywhere
-                devarray = util.create_dataarray_of_nan(
+                devarray = util.create_blank_dataarray(
                     name=refdata[v].name,
                     sizes=devdata.sizes,
                     coords=devdata.coords,
@@ -296,7 +299,7 @@ def create_total_emissions_table(
                 )
 
                 # Set Ref to NaN (missing values) everywhere
-                refarray = util.create_dataarray_of_nan(
+                refarray = util.create_blank_dataarray(
                     name=devdata[v].name,
                     sizes=refdata.sizes,
                     coords=refdata.coords,
@@ -555,6 +558,7 @@ def make_benchmark_conc_plots(
         verbose=False,
         collection="SpeciesConc",
         benchmark_type="FullChemBenchmark",
+        cmpres=None,
         plot_by_spc_cat=True,
         restrict_cats=[],
         plots=["sfc", "500hpa", "zonalmean"],
@@ -580,16 +584,14 @@ def make_benchmark_conc_plots(
     Args:
         ref: str
             Path name for the "Ref" (aka "Reference") data set.
-        refstr: str OR list of str
+        refstr: str
             A string to describe ref (e.g. version number)
-            OR list containing [ref1str, ref2str] for diff-of-diffs plots
         dev: str
             Path name for the "Dev" (aka "Development") data set.
             This data set will be compared against the "Reference"
             data set.
-        devstr: str OR list of str
+        devstr: str
             A string to describe dev (e.g. version number)
-            OR list containing [dev1str, dev2str] for diff-of-diffs plots
 
     Keyword Args (optional):
         dst: str
@@ -610,13 +612,15 @@ def make_benchmark_conc_plots(
         verbose: bool
             Set this flag to True to print extra informational output.
             Default value: False
-                collection: str
-                        Name of collection to use for plotting.
-                        Default value: "SpeciesConc"
-                benchmark_type: str
-                        A string denoting the type of benchmark output to plot,
-                        either FullChemBenchmark or TransportTracersBenchmark.
-                        Default value: "FullChemBenchmark"
+        collection: str
+            Name of collection to use for plotting.
+            Default value: "SpeciesConc"
+        benchmark_type: str
+            A string denoting the type of benchmark output to plot,
+            either FullChemBenchmark or TransportTracersBenchmark.
+            Default value: "FullChemBenchmark"
+        cmpres: string
+            Grid resolution at which to compare ref and dev data, e.g. '1x1.25'
         plot_by_spc_cat: logical
             Set this flag to False to send plots to one file rather
             than separate file per category.
@@ -635,7 +639,7 @@ def make_benchmark_conc_plots(
         normalize_by_area: bool
             Set this flag to true to enable normalization of data
             by surfacea area (i.e. kg s-1 --> kg s-1 m-2).
-                        Default value: False
+            Default value: False
         cats_in_ugm3: list of str
             List of benchmark categories to to convert to ug/m3
             Default value: ["Aerosols", "Secondary_Organic_Aerosols"]
@@ -703,11 +707,17 @@ def make_benchmark_conc_plots(
         extra_title_txt = None
 
     # Pick the proper function to read the data
-    reader = util.dataset_reader(time_mean)
+    reader = util.dataset_reader(time_mean, verbose=verbose)
 
     # Open datasets
-    refds = reader(ref, drop_variables=gcon.skip_these_vars)
-    devds = reader(dev, drop_variables=gcon.skip_these_vars)
+    refds = reader(ref, drop_variables=gcon.skip_these_vars).load()
+    devds = reader(dev, drop_variables=gcon.skip_these_vars).load()
+
+    if verbose:
+        print('\nPrinting refds (comparison ref)\n')
+        print(refds)
+        print('\nPrinting devds (comparison dev)\n')
+        print(devds)
 
     # -----------------------------------------------------------------
     # Kludge, rename wrong variable name
@@ -716,14 +726,14 @@ def make_benchmark_conc_plots(
     if "SpeciesConc_PFE" in devds.data_vars.keys():
         devds = devds.rename({"SpeciesConc_PFE": "SpeciesConc_pFe"})
     # -----------------------------------------------------------------
-        
+
     # Open met datasets if passed as arguments
     refmetds = None
     devmetds = None
     if refmet:
-        refmetds = reader(refmet, drop_variables=gcon.skip_these_vars)
+        refmetds = reader(refmet, drop_variables=gcon.skip_these_vars).load()
     if devmet:
-        devmetds = reader(devmet, drop_variables=gcon.skip_these_vars)
+        devmetds = reader(devmet, drop_variables=gcon.skip_these_vars).load()
 
     # Determine if doing diff-of-diffs
     if second_ref is not None and second_dev is not None:
@@ -732,9 +742,57 @@ def make_benchmark_conc_plots(
         diff_of_diffs = False
 
     # Open second datasets if passed as arguments (used for diff of diffs)
+    # Regrid to same horz grid resolution if two refs or two devs do not match.
     if diff_of_diffs:
-        second_refds = reader(second_ref, drop_variables=gcon.skip_these_vars)
-        second_devds = reader(second_dev, drop_variables=gcon.skip_these_vars)
+        second_refds = reader(second_ref, drop_variables=gcon.skip_these_vars).load()
+        second_devds = reader(second_dev, drop_variables=gcon.skip_these_vars).load()
+
+        print('\nPrinting second_refds (dev of ref for diff-of-diffs)\n')
+        print(second_refds)
+        print('\nPrinting second_devds (dev of dev for diff-of-diffs)\n')
+        print(second_devds)
+
+        # Only regrid if ref grid resolutions differ.
+        # Assume only may differ if both cubed-sphere.
+        # If different, assume the two resolutions are C24 and C48,
+        # and do the comparison at C48.
+        regrid_ref = False
+        if "Xdim" in refds.dims and "Xdim" in second_refds.dims:
+            if refds['Xdim'].size != second_refds['Xdim'].size:
+                regrid_ref = True
+        regrid_dev = False
+        if "Xdim" in devds.dims and "Xdim" in second_devds.dims:
+            if devds['Xdim'].size != second_devds['Xdim'].size:
+                regrid_dev = True
+        if regrid_ref or regrid_dev:
+            # Assume regridding C24 to C48 to compute the difference at C48
+            regridfile=os.path.join(weightsdir,'regrid_weights_c24_to_c48.nc')
+            transform = sparselt.esmf.load_weights(
+                regridfile,
+                input_dims=[('nf', 'Ydim', 'Xdim'), (6, 24, 24)],
+                output_dims=[('nf', 'Ydim', 'Xdim'), (6, 48, 48)],
+            )
+            if regrid_ref and refds['Xdim'].size == 24:
+                print('\nRegridding ref dataset 1 from C24 to C48\n')
+                refds = sparselt.xr.apply(transform, refds)
+                print(refds)
+                print('\nRegrid complete\n')
+            if regrid_ref and second_refds['Xdim'].size == 24:
+                print('\nRegridding ref dataset 2 from C24 to C48\n')
+                second_refds = sparselt.xr.apply(transform, second_refds)
+                print(second_refds)
+                print('\nRegrid complete\n')
+            if regrid_dev and devds['Xdim'].size == 24:
+                print('\nRegridding dev dataset 1 from C24 to C48\n')
+                devds = sparselt.xr.apply(transform, devds)
+                print(devds)
+                print('\nRegrid complete\n')
+            if regrid_dev and second_devds['Xdim'].size == 24:
+                print('\nRegridding dev dataset 2 from C24 to C48\n')
+                second_devds = sparselt.xr.apply(transform, second_devds)
+                print(second_devds)
+                print('\nRegrid complete\n')
+
     else:
         second_refds = None
         second_devds = None
@@ -785,6 +843,7 @@ def make_benchmark_conc_plots(
         pdfname = os.path.join(dst, 'SpeciesConc_Sfc.pdf')
         compare_single_level(refds, refstr, devds, devstr,
                              varlist=varlist,
+                             cmpres=cmpres,
                              pdfname=pdfname,
                              use_cmap_RdBu=use_cmap_RdBu,
                              log_color_scale=log_color_scale,
@@ -802,6 +861,7 @@ def make_benchmark_conc_plots(
         compare_single_level(refds, refstr, devds, devstr,
                              ilev=22,
                              varlist=varlist,
+                             cmpres=cmpres,
                              pdfname=pdfname,
                              use_cmap_RdBu=use_cmap_RdBu,
                              log_color_scale=log_color_scale,
@@ -839,14 +899,17 @@ def make_benchmark_conc_plots(
 
     # FullChemBenchmark has lumped species (TransportTracers does not)
     if "FullChem" in benchmark_type:
-        print("\nAdding lumped species to ref dataset")
+        print("\nComputing lumped species for full chemistry benchmark")
+        print("-->Adding lumped species to ref dataset")
         refds = util.add_lumped_species_to_dataset(refds)
-        print("\nAdding lumped species to dev dataset")
+        print("-->Adding lumped species to dev dataset")
         devds = util.add_lumped_species_to_dataset(devds)
         if diff_of_diffs:
+            print("-->Adding lumped species to dev datasets")
             second_refds = util.add_lumped_species_to_dataset(second_refds)
             second_devds = util.add_lumped_species_to_dataset(second_devds)
         util.archive_lumped_species_definitions(dst)
+        print("Lumped species computation complete.\n")
 
     # Get the list of species categories
     catdict = util.get_species_categories(benchmark_type)
@@ -924,6 +987,7 @@ def make_benchmark_conc_plots(
                 pdfname = os.path.join(
                     catdir, "{}_Surface_{}.pdf".format(filecat, subdst)
                 )
+                print('creating {}'.format(pdfname))
             else:
                 pdfname = os.path.join(
                     catdir, "{}_Surface.pdf".format(filecat))
@@ -936,6 +1000,7 @@ def make_benchmark_conc_plots(
                 devstr,
                 varlist=varlist,
                 ilev=0,
+                cmpres=cmpres,
                 refmet=refmetds,
                 devmet=devmetds,
                 pdfname=pdfname,
@@ -978,6 +1043,7 @@ def make_benchmark_conc_plots(
                 devstr,
                 varlist=varlist,
                 ilev=22,
+                cmpres=cmpres,
                 refmet=refmetds,
                 devmet=devmetds,
                 pdfname=pdfname,
@@ -1088,6 +1154,9 @@ def make_benchmark_conc_plots(
     results = Parallel(n_jobs=n_job)(
         delayed(createplots)(filecat) for _, filecat in enumerate(catdict)
     )
+#     # Do not create plots in parallel
+#    for _, filecat in enumerate(catdict):
+#        createplots(filecat)
 
     dict_sfc = {list(result.keys())[0]: result[list(
         result.keys())[0]]['sfc'] for result in results}
@@ -1135,12 +1204,13 @@ def make_benchmark_conc_plots(
     # -------------------------------------------
     # Clean up
     # -------------------------------------------
-    refds = xr.Dataset()
-    devds = xr.Dataset()
-    refmetds = xr.Dataset()
-    devmetds = xr.Dataset()
-    second_ref = xr.Dataset()
-    second_dev = xr.Dataset()
+    del refds
+    del devds
+    del refmetds
+    del devmetds
+    del second_ref
+    del second_dev
+    gc.collect()
 
 
 def make_benchmark_emis_plots(
@@ -1152,6 +1222,7 @@ def make_benchmark_emis_plots(
         subdst=None,
         plot_by_spc_cat=False,
         plot_by_hco_cat=False,
+        cmpres=None,
         overwrite=False,
         verbose=False,
         flip_ref=False,
@@ -1203,6 +1274,8 @@ def make_benchmark_emis_plots(
             according to HEMCO emissions categories (e.g. Anthro,
             Aircraft, Bioburn, etc.)
             Default value: False
+        cmpres: string
+            Grid resolution at which to compare ref and dev data, e.g. '1x1.25'
         overwrite: bool
             Set this flag to True to overwrite files in the
             destination folder (specified by the dst argument).
@@ -1281,7 +1354,7 @@ def make_benchmark_emis_plots(
         extra_title_txt = None
 
     # Get the function that will read the dataset
-    reader = util.dataset_reader(time_mean)
+    reader = util.dataset_reader(time_mean, verbose=verbose)
 
     # Ref dataset
     try:
@@ -1309,8 +1382,7 @@ def make_benchmark_emis_plots(
     [_ for _ in create_regridders(refds, devds, weightsdir=weightsdir)]
 
     # Combine 2D and 3D variables into an overall list
-    quiet = not verbose
-    vardict = util.compare_varnames(refds, devds, quiet=quiet)
+    vardict = util.compare_varnames(refds, devds, quiet=(not verbose))
     vars2D = vardict["commonvars2D"]
     vars3D = vardict["commonvars3D"]
     varlist = vars2D + vars3D
@@ -1341,6 +1413,7 @@ def make_benchmark_emis_plots(
             devds,
             devstr,
             varlist=varlist,
+            cmpres=cmpres,
             pdfname=pdfname,
             log_color_scale=log_color_scale,
             extra_title_txt=extra_title_txt,
@@ -1408,6 +1481,7 @@ def make_benchmark_emis_plots(
                 devds,
                 devstr,
                 varlist=varnames,
+                cmpres=cmpres,
                 ilev=0,
                 pdfname=pdfname,
                 log_color_scale=log_color_scale,
@@ -1515,6 +1589,7 @@ def make_benchmark_emis_plots(
                 devds,
                 devstr,
                 varlist=varlist,
+                cmpres=cmpres,
                 ilev=0,
                 pdfname=pdfname,
                 flip_ref=flip_ref,
@@ -1544,8 +1619,9 @@ def make_benchmark_emis_plots(
     # -------------------------------------------
     # Clean up
     # -------------------------------------------
-    refds = xr.Dataset()
-    devds = xr.Dataset()
+    del refds
+    del devds
+    gc.collect()
 
 
 def make_benchmark_emis_tables(
@@ -1719,10 +1795,11 @@ def make_benchmark_emis_tables(
     # -------------------------------------------
     # Clean up
     # -------------------------------------------
-    refds = xr.Dataset()
-    devds = xr.Dataset()
-    refmetds = xr.Dataset()
-    devmetds = xr.Dataset()
+    del refds
+    del devds
+    del refmetds
+    del devmetds
+    gc.collect()
 
 
 def make_benchmark_jvalue_plots(
@@ -1734,6 +1811,7 @@ def make_benchmark_jvalue_plots(
         dst="./benchmark",
         subdst=None,
         local_noon_jvalues=False,
+        cmpres=None,
         plots=["sfc", "500hpa", "zonalmean"],
         overwrite=False,
         verbose=False,
@@ -1787,6 +1865,8 @@ def make_benchmark_jvalue_plots(
             which is the fraction of the time that it was local noon
             at each location.
             Default value: False
+        cmpres: string
+            Grid resolution at which to compare ref and dev data, e.g. '1x1.25'
         plots: list of strings
             List of plot types to create.
             Default value: ['sfc', '500hpa', 'zonalmean']
@@ -1863,7 +1943,7 @@ def make_benchmark_jvalue_plots(
         os.mkdir(dst)
 
     # Get the function that will read file(s) into a Dataset
-    reader = util.dataset_reader(time_mean)
+    reader = util.dataset_reader(time_mean, verbose=verbose)
 
     # Ref dataset
     try:
@@ -1892,8 +1972,7 @@ def make_benchmark_jvalue_plots(
 
     # Get a list of the 3D variables in both datasets
     if varlist is None:
-        quiet = not verbose
-        vardict = util.compare_varnames(refds, devds, quiet=quiet)
+        vardict = util.compare_varnames(refds, devds, quiet=(not verbose))
         cmn = vardict["commonvars3D"]
 
     # ==================================================================
@@ -2000,6 +2079,7 @@ def make_benchmark_jvalue_plots(
             devds,
             devstr,
             varlist=varlist,
+            cmpres=cmpres,
             ilev=22,
             pdfname=pdfname,
             flip_ref=flip_ref,
@@ -2114,8 +2194,9 @@ def make_benchmark_jvalue_plots(
     # -------------------------------------------
     # Clean up
     # -------------------------------------------
-    refds = xr.Dataset()
-    devds = xr.Dataset()
+    del refds
+    del devds
+    gc.collect()
 
 
 def make_benchmark_aod_plots(
@@ -2126,6 +2207,7 @@ def make_benchmark_aod_plots(
         varlist=None,
         dst="./benchmark",
         subdst=None,
+        cmpres=None,
         overwrite=False,
         verbose=False,
         log_color_scale=False,
@@ -2169,6 +2251,8 @@ def make_benchmark_aod_plots(
             and denotes a date string (such as "Jan2016") that
             corresponds to the month that is being plotted.
             Default value: None
+        cmpres: string
+            Grid resolution at which to compare ref and dev data, e.g. '1x1.25'
         overwrite: bool
             Set this flag to True to overwrite files in the
             destination folder (specified by the dst argument).
@@ -2230,7 +2314,7 @@ def make_benchmark_aod_plots(
         extra_title_txt = None
 
     # Get the function that will read file(s) into a dataset
-    reader = util.dataset_reader(time_mean)
+    reader = util.dataset_reader(time_mean, verbose=verbose)
 
     # Read the Ref dataset
     try:
@@ -2283,8 +2367,7 @@ def make_benchmark_aod_plots(
     # Find common AOD variables in both datasets
     # (or use the varlist passed via keyword argument)
     if varlist is None:
-        quiet = not verbose
-        vardict = util.compare_varnames(refds, devds, quiet)
+        vardict = util.compare_varnames(refds, devds, quiet=(not verbose))
         cmn3D = vardict["commonvars3D"]
         varlist = [v for v in cmn3D if "AOD" in v and "_bin" not in v]
 
@@ -2397,6 +2480,7 @@ def make_benchmark_aod_plots(
         devds,
         devstr,
         varlist=newvarlist,
+        cmpres=cmpres,
         ilev=0,
         pdfname=pdfname,
         log_color_scale=log_color_scale,
@@ -2428,8 +2512,9 @@ def make_benchmark_aod_plots(
     # -------------------------------------------
     # Clean up
     # -------------------------------------------
-    refds = xr.Dataset()
-    devds = xr.Dataset()
+    del refds
+    del devds
+    gc.collect()
 
 
 def make_benchmark_mass_tables(
@@ -2444,8 +2529,8 @@ def make_benchmark_mass_tables(
         verbose=False,
         label="at end of simulation",
         spcdb_dir=os.path.dirname(__file__),
-        ref_met_extra='',
-        dev_met_extra=''
+        ref_met_extra=None,
+        dev_met_extra=None
 ):
     """
     Creates a text file containing global mass totals by species and
@@ -2542,26 +2627,31 @@ def make_benchmark_mass_tables(
     # ==================================================================
     # Make sure that all necessary meteorological variables are found
     # ==================================================================
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=xr.SerializationWarning)
 
-    # Find the area variables in Ref and Dev
-    try:
-        ref_area = util.get_area_from_dataset(refds)
-    except ValueError:
-        if ref_met_extra != '':
-            ref_met_extra = xr.open_dataset(ref_met_extra)
-            ref_area = util.get_area_from_dataset(ref_met_extra)
+        # Find the area variable in Ref
+        if ref_met_extra is None:
+            ref_area = util.get_area_from_dataset(refds)
         else:
-            raise ValueError(
-                'Must pass Met data if using a restart file without area')
-    try:
-        dev_area = util.get_area_from_dataset(devds)
-    except ValueError:
-        if dev_met_extra != '':
-            dev_met_extra = xr.open_dataset(dev_met_extra)
-            dev_area = util.get_area_from_dataset(dev_met_extra)
+            ref_area = util.get_area_from_dataset(
+                xr.open_dataset(
+                    ref_met_extra,
+                    drop_variables=gcon.skip_these_vars
+                )
+            )
+
+        # Find the area variable in Dev
+        if dev_met_extra is None:
+            dev_area = util.get_area_from_dataset(devds)
         else:
-            raise ValueError(
-                'Must pass Met data if using a restart file without area')
+            dev_area = util.get_area_from_dataset(
+                xr.open_dataset(
+                    dev_met_extra,
+                    drop_variables=gcon.skip_these_vars
+                )
+            )
+
     # Find required meteorological variables in Ref
     # (or exit with an error if we can't find them)
     metvar_list = ["Met_DELPDRY", "Met_BXHEIGHT", "Met_TropLev"]
@@ -2681,8 +2771,9 @@ def make_benchmark_mass_tables(
     # -------------------------------------------
     # Clean up
     # -------------------------------------------
-    refds = xr.Dataset()
-    devds = xr.Dataset()
+    del refds
+    del devds
+    gc.collect()
 
 
 def make_benchmark_oh_metrics(
@@ -2908,10 +2999,11 @@ def make_benchmark_oh_metrics(
     # -------------------------------------------
     # Clean up
     # -------------------------------------------
-    refds = xr.Dataset()
-    devds = xr.Dataset()
-    refmetds = xr.Dataset()
-    devmetds = xr.Dataset()
+    del refds
+    del devds
+    del refmetds
+    del devmetds
+    gc.collect()
 
 
 def make_benchmark_wetdep_plots(
@@ -2921,6 +3013,7 @@ def make_benchmark_wetdep_plots(
         devstr,
         collection,
         dst="./benchmark",
+        cmpres=None,
         datestr=None,
         overwrite=False,
         verbose=False,
@@ -3025,7 +3118,7 @@ def make_benchmark_wetdep_plots(
             os.mkdir(targetdst)
 
     # Get the function that will read file(s) into a dataset
-    reader = util.dataset_reader(time_mean)
+    reader = util.dataset_reader(time_mean, verbose=verbose)
 
     # Open datasets
     refds = reader(ref, drop_variables=gcon.skip_these_vars)
@@ -3056,7 +3149,7 @@ def make_benchmark_wetdep_plots(
     #[refds, devds] = add_missing_variables(refds, devds)
 
     # Get list of variables in collection
-    vardict = util.compare_varnames(refds, devds, quiet=True)
+    vardict = util.compare_varnames(refds, devds, quiet=(not verbose))
     varlist = [v for v in vardict["commonvars3D"] if collection + "_" in v]
     varlist.sort()
 
@@ -3073,6 +3166,7 @@ def make_benchmark_wetdep_plots(
             devds,
             devstr,
             varlist=varlist,
+            cmpres=cmpres,
             ilev=0,
             refmet=refmetds,
             devmet=devmetds,
@@ -3102,6 +3196,7 @@ def make_benchmark_wetdep_plots(
             devds,
             devstr,
             varlist=varlist,
+            cmpres=cmpres,
             ilev=22,
             refmet=refmetds,
             devmet=devmetds,
@@ -3190,10 +3285,11 @@ def make_benchmark_wetdep_plots(
     # -------------------------------------------
     # Clean up
     # -------------------------------------------
-    refds = xr.Dataset()
-    devds = xr.Dataset()
-    refmetds = xr.Dataset()
-    devmetds = xr.Dataset()
+    del refds
+    del devds
+    del refmetds
+    del devmetds
+    gc.collect()
 
 
 def make_benchmark_aerosol_tables(
@@ -3476,9 +3572,10 @@ def make_benchmark_aerosol_tables(
     # -------------------------------------------
     # Clean up
     # -------------------------------------------
-    ds_aer = xr.Dataset()
-    ds_spc = xr.Dataset()
-    ds_met = xr.Dataset()
+    del ds_aer
+    del ds_spc
+    del ds_met
+    gc.collect()
 
 
 def make_benchmark_operations_budget(
@@ -3497,7 +3594,8 @@ def make_benchmark_operations_budget(
         require_overlap=False,
         dst='.',
         species=None,
-        overwrite=True
+        overwrite=True,
+        verbose=False
 ):
     """
     Prints the "operations budget" (i.e. change in mass after
@@ -3553,6 +3651,10 @@ def make_benchmark_operations_budget(
         overwrite: bool
             Denotes whether to overwrite existing budget file.
             Default value: True
+        verbose: bool
+            Set this switch to True if you wish to print out extra
+            informational messages.
+            Default value: False
     """
 
     # ------------------------------------------
@@ -4002,9 +4104,10 @@ def make_benchmark_operations_budget(
     # ------------------------------------------
     # Clean up
     # ------------------------------------------
-    df = pd.DataFrame()
-    ref_ds = xr.Dataset()
-    dev_ds = xr.Dataset()
+    del df
+    del ref_ds
+    del dev_ds
+    gc.collect()
 
 
 def make_benchmark_mass_conservation_table(
@@ -4012,6 +4115,7 @@ def make_benchmark_mass_conservation_table(
         runstr,
         dst="./benchmark",
         overwrite=False,
+        areapath=None,
         spcdb_dir=os.path.dirname(__file__)
 ):
     """
@@ -4042,6 +4146,12 @@ def make_benchmark_mass_conservation_table(
             Set this flag to True to overwrite files in the
             destination folder (specified by the dst argument).
             Default value: False
+        areapath: str
+            Path to a restart file containing surface area data.
+            Default value: None
+        spcdb_dir: str
+            Path to the species_database.yml
+            Default value: points to gcpy/gcpy folder
     """
 
     # ==================================================================
@@ -4073,6 +4183,13 @@ def make_benchmark_mass_conservation_table(
     masses = []
 
     # ==================================================================
+    # Make sure that surface area data is found
+    # ==================================================================
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=xr.SerializationWarning)
+
+
+    # ==================================================================
     # Calculate global mass for the tracer at all restart dates
     # ==================================================================
     for f in datafiles:
@@ -4082,12 +4199,22 @@ def make_benchmark_mass_conservation_table(
         #datestr = str(pd.to_datetime(ds.time.values[0]))
         #dates.append(datestr[:4] + '-' + datestr[5:7] + '-' + datestr[8:10])
 
+        # Find the area variable in Dev
+        if areapath is None:
+            area = util.get_area_from_dataset(ds)
+        else:
+            area = util.get_area_from_dataset(
+                xr.open_dataset(
+                    areapath,
+                    drop_variables=gcon.skip_these_vars
+                )
+            )
+
         # Assume typical restart file name format, but avoid using dates
         # from within files which may be incorrect for the initial restart
         datestr = f.split('/')[-1].split('.')[2][:9]
         dates.append(datestr[:4] + '-' + datestr[4:6] + '-' + datestr[6:8])
 
-        area = util.get_area_from_dataset(ds)
         # Select for GCC or GCHP
         delta_p = ds['Met_DELPDRY'] if 'Met_DELPDRY' in list(ds.data_vars) else ds['DELP_DRY']
 
@@ -4115,9 +4242,11 @@ def make_benchmark_mass_conservation_table(
 
         # Save total global mass
         masses.append(np.sum(da.values))
+
         # Clean up
-        ds = xr.Dataset()
-        da = xr.DataArray()
+        del ds
+        del da
+        gc.collect()
 
     # Calclate max and min mass, absolute diff, percent diff
     max_mass = np.max(masses)
@@ -4151,3 +4280,49 @@ def make_benchmark_mass_conservation_table(
         print(' Min mass =  {:2.13f} Tg'.format(min_mass), file=f)
         print(' Abs diff =  {:>16.3f} g'.format(absdiff), file=f)
         print(' Pct diff =  {:>16.10f} %'.format(pctdiff), file=f)
+
+    gc.collect()
+
+
+def get_species_database_dir(config):
+    """
+    Returns the directory in which the species_database.yml file is
+    located.  If "paths:spcdb_dir" (as specified in the benchmark YAML
+    configuration file) is None, then it will look for species_database.yml
+    in a default location (i.e. in one of the Dev folders).
+
+    Args:
+    -----
+    config: dict
+        Dictionary containing configuration information as read in
+        from a benchmark configuration YAML file.
+
+    Returns:
+    --------
+    spcdb_dir: str
+        Path to the directory in which the species_database.yml file
+        is located.
+    """
+    spcdb_dir = config["paths"]["spcdb_dir"]
+    if "DEFAULT" in spcdb_dir.upper():
+        if config["options"]["comparisons"]["gchp_vs_gchp"]["run"]:
+            spcdb_dir = os.path.join(
+                config["paths"]["main_dir"],
+                config["data"]["dev"]["gchp"]["dir"]
+            )
+        else:
+            spcdb_dir = os.path.join(
+                config["paths"]["main_dir"],
+                config["data"]["dev"]["gcc"]["dir"]
+            )
+    spcdb_path = os.path.join(
+        spcdb_dir,
+        "species_database.yml"
+    )
+    if os.path.exists(os.path.join(spcdb_path)):
+        msg = f"Using species database {spcdb_dir}/species_database.yml"
+        print(msg)
+        return spcdb_dir
+    else:
+        msg = f"Could not find the {spcdb_dir}/species_database.yml file!"
+        raise FileNotFoundError(msg)

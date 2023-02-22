@@ -355,14 +355,12 @@ def compare_single_level(
     Args:
         refdata: xarray dataset
             Dataset used as reference in comparison
-        refstr: str OR list of str
+        refstr: str
             String description for reference data to be used in plots
-            OR list containing [ref1str, ref2str] for diff-of-diffs plots
         devdata: xarray dataset
             Dataset used as development in comparison
-        devstr: str OR list of str
+        devstr: str
             String description for development data to be used in plots
-            OR list containing [dev1str, dev2str] for diff-of-diffs plots
 
     Keyword Args (optional):
         varlist: list of strings
@@ -492,12 +490,14 @@ def compare_single_level(
     if diff_of_diffs:
         refdata, devdata = refdata.load(), devdata.load()
         second_ref, second_dev = second_ref.load(), second_dev.load()
-        #use fake time dim in case dates are different in datasets
-        aligned_time = np.datetime64('2000-01-01')
-        refdata = refdata.assign_coords({'time': [aligned_time]})
-        devdata = devdata.assign_coords({'time': [aligned_time]})
-        second_ref = second_ref.assign_coords({'time': [aligned_time]})
-        second_dev = second_dev.assign_coords({'time': [aligned_time]})
+
+#        # If needed, use fake time dim in case dates are different in datasets.
+#        # This needs more work for case of single versus multiple times.
+#        aligned_time = [np.datetime64('2000-01-01')] * refdata.dims['time']
+#        refdata = refdata.assign_coords({'time': aligned_time})
+#        devdata = devdata.assign_coords({'time': aligned_time})
+#        second_ref = second_ref.assign_coords({'time': aligned_time})
+#        second_dev = second_dev.assign_coords({'time': aligned_time})
 
         refdata, fracrefdata = get_diff_of_diffs(refdata, second_ref)
         devdata, fracdevdata = get_diff_of_diffs(devdata, second_dev)
@@ -1488,14 +1488,12 @@ def compare_zonal_mean(
     Args:
         refdata: xarray dataset
             Dataset used as reference in comparison
-        refstr: str OR list of str
+        refstr: str
             String description for reference data to be used in plots
-            OR list containing [ref1str, ref2str] for diff-of-diffs plots
         devdata: xarray dataset
             Dataset used as development in comparison
-        devstr: str OR list of str
+        devstr: str
             String description for development data to be used in plots
-            OR list containing [dev1str, dev2str] for diff-of-diffs plots
 
     Keyword Args (optional):
         varlist: list of strings
@@ -1627,12 +1625,14 @@ def compare_zonal_mean(
     if diff_of_diffs:
         refdata, devdata = refdata.load(), devdata.load()
         second_ref, second_dev = second_ref.load(), second_dev.load()
-        #use fake time dim in case dates are different in datasets
-        aligned_time = np.datetime64('2000-01-01')
-        refdata = refdata.assign_coords({'time' : [aligned_time]})
-        devdata = devdata.assign_coords({'time' : [aligned_time]})
-        second_ref = second_ref.assign_coords({'time' : [aligned_time]})
-        second_dev = second_dev.assign_coords({'time' : [aligned_time]})
+
+#        # If needed, use fake time dim in case dates are different in datasets.
+#        # This needs more work for case of single versus multiple times.
+#        aligned_time = np.datetime64('2000-01-01')
+#        refdata = refdata.assign_coords({'time' : [aligned_time]})
+#        devdata = devdata.assign_coords({'time' : [aligned_time]})
+#        second_ref = second_ref.assign_coords({'time' : [aligned_time]})
+#        second_dev = second_dev.assign_coords({'time' : [aligned_time]})
 
         refdata, fracrefdata = get_diff_of_diffs(refdata, second_ref)
         devdata, fracdevdata = get_diff_of_diffs(devdata, second_dev)
